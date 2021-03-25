@@ -1,0 +1,10 @@
+#编译说明
+本程序仅依赖linux系统API,无第三方依赖.
+
+1. 调试版本：
+make clean && make
+
+2. 性能版本
+make clean && make release=1
+
+
