@@ -1,576 +1,739 @@
-#include"sharedheader.h"
-#include"socktool.h"
+#include"director.h"
+#include"sockutil.h"
+#include"sockepoll.h"
 #include"receiver.h"
 #include"sender.h"
-#include"msgdealer.h"
-#include"sockdeal.h"
-#include"sockdata.h"
-#include"sockconf.h"
-#include"director.h"
+#include"dealer.h"
+#include"ticktimer.h"
+#include"msgcenter.h"
+#include"lock.h"
+#include"msgtype.h"
+#include"objcenter.h"
+#include"config.h"
 
 
-SockDirector::SockDirector() {    
+Director::Director(Int32 capacity) : m_capacity(capacity) {
+    INIT_LIST_HEAD(&m_node_que);
+    
+    m_lock = NULL;
+    m_timer = NULL;
+    m_epoll = NULL;
     m_receiver = NULL;
     m_sender = NULL;
     m_dealer = NULL;
 
-    m_msgOper = NULL;
-    m_cache = NULL;
-    m_center = NULL;
-    m_sockConf = NULL;
-
-    m_hasSvc = false;
+    m_event_node = NULL;
+    m_timer_node = NULL;
+    m_obj = NULL;
+    m_cb = NULL;
 }
 
-SockDirector::~SockDirector() {
+Director::~Director() {
 }
 
-int SockDirector::init() {
-    int ret = 0;
+Int32 Director::init() {
+    Int32 ret = 0;
 
-    do {           
-        ret = CPushPool::init();
-        if (0 != ret) {
-            break;
-        }
+    ret = TaskThread::init();
+    if (0 != ret) {
+        return ret;
+    }
 
-        registerEvent(DIRECT_STOP_SOCK, WORK_TYPE_CUSTOMER);
-        registerEvent(WORK_EVENT_END, WORK_TYPE_CUSTOMER);
-        registerEvent(WORK_EVENT_OUT, WORK_TYPE_ONCE);
+    I_NEW_1(GrpSpinLock, m_lock, DEF_LOCK_ORDER);
+    ret = m_lock->init();
+    if (0 != ret) {
+        return ret;
+    }
 
-        m_cache = new SockCache(MAX_SOCK_FD_SIZE);
-		if (NULL == m_cache) {
-            ret = -1;
-			break;
-		}
+    I_NEW(TickTimer, m_timer);
+    m_timer->setDealer(this);
 
-        ret = m_cache->createCache();
-		if (0 != ret) {
-			break;
-		}
+    I_NEW_2(SockEpoll, m_epoll, m_capacity, this);
+    ret = m_epoll->init();
+    if (0 != ret) {
+        return ret;
+    }
 
-        m_msgOper = new MsgBaseQue;
-        if (NULL == m_msgOper) {
-            ret = -1;
-            break;
-        }
+    I_NEW_1(Receiver, m_receiver, this);
+    ret = m_receiver->init();
+    if (0 != ret) {
+        return ret;
+    }
 
-        ret = m_msgOper->init();
-        if (0 != ret) {
-    		break;
-    	}
+    I_NEW_1(Sender, m_sender, this);
+    ret = m_sender->init();
+    if (0 != ret) {
+        return ret;
+    }
 
-        m_sender = new Sender;
-        ret = m_sender->init(this, m_msgOper);
-        if (0 != ret) {
-    		break;
-    	}
+    I_NEW_1(Dealer, m_dealer, this);
+    ret = m_dealer->init();
+    if (0 != ret) {
+        return ret;
+    }
 
-        m_dealer = new MsgDealer;
-        ret = m_dealer->init(this, m_msgOper);
-        if (0 != ret) {
-    		break;
-    	} 
+    ret = creatEvent();
+    if (0 != ret) {
+        return ret;
+    }
 
-        m_receiver = new Receiver;
-        ret = m_receiver->init(this);
-        if (0 != ret) {
-    		break;
-    	}
-        
-        return 0;
-    } while (false);
+    ret = creatTimer();
+    if (0 != ret) {
+        return ret;
+    }
+
+    I_NEW_1(ObjCenter, m_obj, this);
+    ret = m_obj->init();
+    if (0 != ret) {
+        return ret;
+    }
 
     return ret;
 }
 
-void SockDirector::setCenter(SockDeal* center) {
-    m_center = center;
-}
-
-void SockDirector::setConf(SockConf* sockConf) {
-    m_sockConf = sockConf;
-}
-
-void SockDirector::finish() { 
-    if (NULL != m_receiver) {
-        m_receiver->finish();
-        
-        delete m_receiver;
-        m_receiver = NULL;
-    }
-
+Void Director::finish() {
+    freeNodes();
+    
     if (NULL != m_dealer) {
         m_dealer->finish();
-        
-        delete m_dealer;
-        m_dealer = NULL;
+        I_FREE(m_dealer);
     }
 
     if (NULL != m_sender) {
         m_sender->finish();
-        
-        delete m_sender;
-        m_sender = NULL;
+        I_FREE(m_sender);
     }
 
-    if (NULL != m_msgOper) {
-        m_msgOper->finish();
-        delete m_msgOper;
-        m_msgOper = NULL;
+    if (NULL != m_receiver) {
+        m_receiver->finish();
+        I_FREE(m_receiver);
     }
 
-    if (NULL != m_cache) {
-        m_cache->freeCache();
-        
-		delete m_cache;
-		m_cache = NULL;
-	}
+    if (NULL != m_epoll) {
+        m_epoll->finish();
+        I_FREE(m_epoll);
+    } 
+
+    if (NULL != m_event_node) {
+        freeNode(m_event_node);
+        m_event_node = NULL;
+    }
+
+    if (NULL != m_timer_node) {
+        freeNode(m_timer_node);
+        m_timer_node = NULL;
+    }
     
-    CPushPool::finish();
+    if (NULL != m_timer) {
+        I_FREE(m_timer);
+    }
+
+    if (NULL != m_obj) {
+        m_obj->finish();
+        I_FREE(m_obj);
+    }
+
+    if (NULL != m_lock) {
+        m_lock->finish();
+        I_FREE(m_lock);
+    }
+    
+    TaskThread::finish();
 }
 
-int SockDirector::startSvc() {
-    int ret = 0;
+int Director::start() {
+    Int32 ret = 0; 
 
-    do {
-        ret = m_sender->start("sender");
-        if (0 != ret) {
-    		break;
-    	}
+    if (NULL == m_cb) {
+        LOG_ERROR("***start_director| sock_cb=NULL|"
+            " error=you must set sock_cb first!!");
+        return -1;
+    }
 
-        ret = m_dealer->start("dealer");
-        if (0 != ret) {
-    		break;
-    	}
+    ret = m_dealer->start("dealer");
+    if (0 != ret) {
+        return ret;
+    }
 
-        ret = m_receiver->start("receiver");
-        if (0 != ret) {
-    		break;
-    	}
+    ret = m_sender->start("sender");
+    if (0 != ret) {
+        return ret;
+    }
 
-        m_hasSvc = true;
-    } while (false);
+    ret = m_receiver->start("receiver");
+    if (0 != ret) {
+        return ret;
+    }
 
-    return ret;
+    ret = TaskThread::start("director");
+    if (0 != ret) {
+        return ret;
+    }
+
+    return 0;
 }
 
-void SockDirector::waitSvc() {
-    m_receiver->join();
+void Director::join() {
+    TaskThread::join();
+
+    m_dealer->stop();
+    m_sender->stop();
+    m_receiver->stop();
+
     m_dealer->join();
-    m_sender->join();       
+    m_sender->join();
+    m_receiver->join();
 }
 
-void SockDirector::stopSvc() {
-    if (m_hasSvc) {
-        m_hasSvc = false;
-        
-        m_receiver->stop();
-        m_receiver->resume();
-        
+void Director::stop() {
+    if (isRunning()) {
+        TaskThread::stop();
         m_dealer->stop();
-        m_dealer->resume();
-        
-        m_sender->stop(); 
-        m_sender->resume();
+        m_sender->stop();
+        m_receiver->stop();
     }
 }
 
-bool SockDirector::hasSvc() const { 
-    return ACCESS_ONCE(m_hasSvc); 
+Int32 Director::getSize() const {
+    return m_epoll->getSize();
 }
 
-void SockDirector::closeSock(int reason, SockData* pData) {
-    LOG_INFO("close_sock| reason=%d| fd=%d|", reason, pData->m_fd);
+Uint32 Director::getTick() const {
+    return m_timer->monoTick();
+}
+
+Uint32 Director::getTime() const {
+    return m_timer->now();
+}
+
+Void Director::procTick(EnumThreadType type, Uint32 cnt) {
+    switch (type) {
+    case ENUM_THREAD_READ:
+        m_receiver->doTick(cnt);
+        break;
+
+    case ENUM_THREAD_WRITE:
+        m_sender->doTick(cnt);
+        break;
+
+    case ENUM_THREAD_DEALER:
+        m_dealer->doTick(cnt);
+        break;
+
+    case ENUM_THREAD_DIRECTOR:
+        doTick(cnt);
+        break;
+
+    default:
+        break;
+    }
+}
+
+Int32 Director::sendCmd(MsgHdr* msg) {
+    Int32 ret = 0;
+
+    ret = pushCmd(m_event_node, msg);
+    return ret;
+}
+
+Int32 Director::sendMsg(NodeBase* base, MsgHdr* msg) {
+    Int32 ret = 0;
+
+    ret = pushWrite(base, msg);
+    return ret;
+}
+
+Int32 Director::dispatch(NodeBase* base, MsgHdr* msg) {
+    Int32 ret = 0;
+
+    ret = pushDeal(base, msg);
+    return ret;
+}
+
+Int32 Director::pushMsg(EnumThreadType type, NodeBase* base, MsgHdr* msg) {
+    Int32 ret = 0;
     
-    produce(WORK_EVENT_END, &pData->m_monlist);
-}
+    switch (type) { 
+    case ENUM_THREAD_WRITE:
+        ret = pushWrite(base, msg);
+        break;
 
-void SockDirector::stopSock(SockData* pData) {
-    produce(DIRECT_STOP_SOCK, &pData->m_monlist);
-}
+    case ENUM_THREAD_DEALER:
+        ret = pushDeal(base, msg);
+        break;
 
-void SockDirector::dealTimerSec(SockData* pTimer) {
-    /* first deal events */
-    CPushPool::consume();
+    case ENUM_THREAD_DIRECTOR:
+        ret = pushCmd(base, msg);
+        break;
 
-    m_receiver->addNewTask(&pTimer->m_rcvlist);
-    m_sender->addNewTask(&pTimer->m_sndlist);
-    m_dealer->addNewTask(&pTimer->m_deallist);
-}
+    case ENUM_THREAD_READ:
+    default:
+        MsgCenter::freeMsg(msg);
+        ret = -1;
+        break;
+    }
 
-int SockDirector::dealWriteSock(SockData* pData) {
-    int ret = 0;
-
-    ret = m_sender->addWriteTask(&pData->m_sndlist);
     return ret;
 }
 
-int SockDirector::dealReadSock(SockData* pData) {
-    int ret = 0;
+Int32 Director::pushWrite(NodeBase* base, MsgHdr* msg) {
+    Bool bOk = TRUE;
 
-    ret = m_receiver->addReadTask(&pData->m_rcvlist);
+    bOk = lock(base);
+    if (bOk) {
+        MsgCenter::queue(msg, &base->m_wr_que_tmp);
+        
+        unlock(base);
+
+        m_sender->addTask(&base->m_wr_task, BIT_EVENT_NORM);
+
+        return 0;
+    } else {
+        MsgCenter::freeMsg(msg);
+
+        return -1;
+    }
+}
+
+Int32 Director::pushDeal(NodeBase* base, MsgHdr* msg) {
+    Bool bOk = TRUE;
+
+    bOk = lock(base);
+    if (bOk) {
+        MsgCenter::queue(msg, &base->m_deal_que_tmp);
+        
+        unlock(base);
+
+        m_dealer->addTask(&base->m_deal_task, BIT_EVENT_NORM);
+
+        return 0;
+    } else {
+        MsgCenter::freeMsg(msg);
+
+        return -1;
+    }
+}
+
+Int32 Director::pushCmd(NodeBase* base, MsgHdr* msg) {
+    Bool bOk = TRUE;
+
+    bOk = lock(base);
+    if (bOk) {
+        MsgCenter::queue(msg, &base->m_cmd_que_tmp);
+        
+        unlock(base);
+
+        addTask(&base->m_director_task, BIT_EVENT_NORM);
+
+        return 0;
+    } else {
+        MsgCenter::freeMsg(msg);
+
+        return -1;
+    }
+}
+
+Void Director::notify(EnumThreadType type, NodeBase* base, 
+    Uint16 cmd, Uint64 data) {
+    MsgHdr* hdr = NULL;
+    MsgNotify* body = NULL;
+
+    hdr = MsgCenter::creatMsg<MsgNotify>(cmd);
+    if (NULL != hdr) {
+        body = MsgCenter::body<MsgNotify>(hdr);
+
+        body->m_data = data;
+
+        pushMsg(type, base, hdr);
+    }
+}
+
+NodeBase* Director::creatNode(Int32 fd, Int32 type, Int32 status) {
+    NodeBase* node = NULL;
+
+    node = buildNode(fd, type);
+    node->m_fd_status = status;
+
+    list_add_back(&node->m_node, &m_node_que); 
+    return node;
+}
+
+NodeBase* Director::creatNode(Int32 fd, Int32 type, Int32 status,
+    const Char* ip, Int32 port) {
+    NodeBase* node = NULL;
+    SockBase* sock = NULL;
+
+    node = creatNode(fd, type, status);
+    sock = getSockBase(node);
+    if (NULL != sock) {
+        sock->m_port = port;
+        strncpy(sock->m_ip, ip, DEF_IP_SIZE-1);
+    }
+
+    return node;
+}
+
+int Director::delNode(NodeBase* node) {
+    list_del(&node->m_node, &m_node_que); 
+    freeNode(node);
+
+    return 0;
+}
+
+int Director::addEvent(Int32 ev_type, NodeBase* node) {
+    Int32 ret = 0; 
+    
+    ret = m_epoll->addEvent(ev_type, node); 
     return ret;
+}
+
+int Director::delEvent(Int32 ev_type, NodeBase* node) {
+    Int32 ret = 0; 
+
+    ret = m_epoll->delEvent(ev_type, node); 
+    return ret;
+}
+
+int Director::setup() { 
+    return 0;
+}
+
+void Director::teardown() {
+    if (NULL != m_timer) {
+        m_timer->stop();
+    }
+}
+
+Int32 Director::creatEvent() {
+    int fd = -1;
+    
+    fd = creatEventFd(); 
+    if (0 <= fd) { 
+        m_event_node = buildNode(fd, ENUM_NODE_EVENT);
+        m_event_node->m_fd_status = ENUM_FD_NORMAL;
+
+        m_epoll->addEvent(EVENT_TYPE_RD, m_event_node);
+
+        LOG_INFO("++++creat_event| fd=%d| msg=ok|", fd);
+
+        return 0;
+    } else {
+        LOG_ERROR("****creat_event| msg=error|");
+        
+        return -1;
+    }
+}
+
+Int32 Director::creatTimer() {
+    int fd = -1;
+    
+    fd = creatTimerFd(1000); 
+    if (0 <= fd) { 
+        m_timer_node = buildNode(fd, ENUM_NODE_TIMER);
+        m_timer_node->m_fd_status = ENUM_FD_NORMAL;
+
+        m_epoll->addEvent(EVENT_TYPE_RD, m_timer_node);
+
+        LOG_INFO("++++creat_timer| fd=%d| msg=ok|", fd); 
+        
+        return 0;
+    } else {
+        LOG_ERROR("****creat_timer| msg=error|");
+        
+        return -1;
+    }
+}
+
+Void Director::doTimeout(struct TimerEle*) {
+}
+
+Void Director::alarm() {
+    writeEvent(m_event_node->m_fd);
+}
+
+Void Director::wait() {
+    m_epoll->waitEvent(DEF_EPOLL_WAIT_MILI_SEC);
+}
+
+Void Director::check() {
+    m_epoll->waitEvent(0);
+}
+
+unsigned int Director::procTask(struct Task* task) {
+    NodeBase* base = NULL;
+
+    base = list_entry(task, NodeBase, m_director_task);
+
+    procNodeQue(base);
+    
+    return BIT_EVENT_NORM; 
+}
+
+void Director::procTaskEnd(struct Task* task) {
+    NodeBase* base = NULL;
+
+    base = list_entry(task, NodeBase, m_director_task);
+
+    base->m_fd_status = ENUM_FD_CLOSE_DIRECTOR;
+
+    LOG_INFO("proc_task_end| fd=%d| type=%d| msg=finished|",
+        base->m_fd, base->m_node_type);
+
+    m_obj->eof(base); 
+    return;
+}
+
+Void Director::procNodeQue(NodeBase* base) {
+    list_head* list = NULL;
+    list_node* pos = NULL;
+    list_node* n = NULL;
+    MsgHdr* msg = NULL;
+    Bool bOk = TRUE;
+
+    bOk = lock(base);
+    if (bOk) {
+        if (!list_empty(&base->m_cmd_que_tmp)) {
+            list_splice_back(&base->m_cmd_que_tmp, &base->m_cmd_que);
+        }
+        
+        unlock(base);
+    }
+    
+    list = &base->m_cmd_que;
+    if (!list_empty(list)) {
+        list_for_each_safe(pos, n, list) {
+            list_del(pos, list);
+
+            msg = MsgCenter::cast(pos);
+            dealCmd(base, msg);
+        }
+    }
+}
+
+Void Director::dealCmd(NodeBase* base, MsgHdr* msg) {
+    if (ENUM_MSG_SYSTEM_STOP != msg->m_cmd) {
+        m_obj->procCmd(base, msg);
+    } else {
+        procStopMsg(base, msg);
+    } 
+}
+
+Void Director::procStopMsg(NodeBase* base, MsgHdr* msg) {
+    Int32 status = 0;
+    MsgNotify* body = MsgCenter::body<MsgNotify>(msg);
+
+    status = (Int32)body->m_data;
+    if (ENUM_FD_CLOSING == status) {
+        if (base->m_fd_status < status) {
+            base->m_fd_status = ENUM_FD_CLOSING;
+        
+            delEvent(EVENT_TYPE_ALL, base);
+            
+            m_receiver->endTask(&base->m_rd_task);
+        }
+    } else if (ENUM_FD_CLOSE_RD == status) {
+        base->m_fd_status = status;
+        
+        m_sender->endTask(&base->m_wr_task);
+    } else if (ENUM_FD_CLOSE_WR == status) {
+        base->m_fd_status = status;
+            
+        m_dealer->endTask(&base->m_deal_task);
+    } else if (ENUM_FD_CLOSE_DEALER == status) {
+        base->m_fd_status = status;
+        
+        /* this go to myself end */
+        endTask(&base->m_director_task);
+    } else {
+        /* invalid */
+    }
+
+    MsgCenter::freeMsg(msg);
+}
+
+Void Director::close(NodeBase* base) {
+    /*do some thing */
+
+    notify(ENUM_THREAD_DIRECTOR, base, ENUM_MSG_SYSTEM_STOP, ENUM_FD_CLOSING);
+}
+
+Bool Director::lock(NodeBase* base) {
+    int idx = base->m_fd;
+
+    return m_lock->lock(idx);
+}
+
+Bool Director::unlock(NodeBase* base) {
+    int idx = base->m_fd;
+
+    return m_lock->unlock(idx);
+}
+
+Void Director::addReadable(struct NodeBase* base) {
+    m_receiver->addTask(&base->m_rd_task, BIT_EVENT_READ);
+}
+
+Void Director::addWriteable(struct NodeBase* base) {
+    m_sender->addTask(&base->m_wr_task, BIT_EVENT_WRITE);
+}
+
+Void Director::doTick(Uint32 cnt) {
+    m_timer->tick(cnt); 
+}
+
+void Director::addTimer(struct TimerEle* ele, 
+    Int32 type, Uint32 interval) {
+    
+    ele->m_type = type;
+    ele->m_interval = interval;
+
+    m_timer->addTimer(ele);
 } 
 
-int SockDirector::sendMsg(SockData* pData, struct msg_type* pMsg) {
-    int ret = 0;
-    bool bOk = true;
-    int fd = pData->m_fd; 
-    int size = pMsg->m_size;
+Uint32 Director::readNode(struct NodeBase* base) {
+    Uint32 ret = 0;
 
-    if (DEF_MSG_HEADER_SIZE <= size) {
-        if (isSockValid(pData)) {
-            bOk = m_msgOper->pushMsg(fd, &pData->m_sndMsgQue, pMsg);
-            if (bOk) {
-                ret = 0;
+    if (!base->m_rd_err) {
+        ret = m_obj->readNode(base);
 
-                m_sender->calcMsgIn(ret, size);
-                m_sender->addNewTask(&pData->m_sndlist);
-            } else {
-                LOG_WARN("sendMsg| fd=%d| state=%d|"
-                    " len=%d| msg=send error|",
-                    fd, pData->m_state, size);
-
-                ret = -1;
-            }
-        } else {
-            LOG_DEBUG("sendMsg| fd=%d| state=%d| len=%d|"
-                " msg=socket state is invalid|", 
-                fd, pData->m_state, size);
-            
-            ret = -2;        
-            MsgQueOper::freeMsg(pMsg);
-        }
+        return ret;
     } else {
-        LOG_WARN("sendMsg| fd=%d| state=%d| len=%d|"
-            " msg=invalid msg len([%d:%d])|", 
-            fd, pData->m_state, size, 
-            DEF_MSG_HEADER_SIZE, MAX_PKG_MSG_SIZE);
-        
-        ret = -3;
-        MsgQueOper::freeMsg(pMsg);
-    }
-
-    return ret;
+        close(base);
+        return BIT_EVENT_ERROR;
+    } 
 }
 
-int SockDirector::sendData(SockData* pData, char* data, int len) {
-    int ret = 0;
-    int fd = -1;
-    bool bOk = true;
-    
-    fd = pData->m_fd; 
-    if (DEF_MSG_HEADER_SIZE <= len) {
-        if (isSockValid(pData)) {
-            bOk = m_msgOper->pushData(fd, &pData->m_sndMsgQue, data, len);
-            if (bOk) {
-                ret = 0;
+Uint32 Director::writeNode(struct NodeBase* base) {
+    Uint32 ret = 0;
 
-                m_sender->calcMsgIn(ret, len);
-                m_sender->addNewTask(&pData->m_sndlist);
-            } else {
-                LOG_WARN("sendData| fd=%d| state=%d|"
-                    " data=%p| len=%d| msg=send error|",
-                    fd, pData->m_state, data, len);
-                
-                ret = -1;
-            }
-        } else {
-            LOG_DEBUG("sendData| fd=%d| state=%d| data=%p| len=%d|"
-                " msg=socket state is invalid|", 
-                fd, pData->m_state, data, len);
-            
+    if (!base->m_wr_err) {
+        ret = m_obj->writeNode(base);
+
+        return ret;
+    } else {
+        close(base);
+        return BIT_EVENT_ERROR;
+    } 
+}
+
+Void Director::dealMsg(struct NodeBase* base, struct MsgHdr* msg) {
+    Int32 ret = 0;
+    
+    if (!base->m_deal_err) {
+        ret = m_obj->procMsg(base, msg);
+        if (0 != ret) {
+            base->m_deal_err = TRUE;
+            close(base);
+        }
+    } else {
+        MsgCenter::freeMsg(msg);
+    }
+}
+
+Int32 Director::addListener(TcpParam* param) {
+    Int32 ret = 0;
+    Int32 fd = -1;
+    NodeBase* base = NULL; 
+
+    do { 
+        fd = creatTcpSrv(param);
+        if (0 > fd) {
             ret = -2;
-        }
-    } else {
-        LOG_WARN("sendData| fd=%d| state=%d| data=%p| len=%d|"
-            " msg=invalid msg len([%d:%d])|", 
-            fd, pData->m_state, data, 
-            len, DEF_MSG_HEADER_SIZE, MAX_PKG_MSG_SIZE);
-        
-        ret = -3;
-    }
-
-    return ret;
-}
-
-int SockDirector::dispatchMsg(SockData* pData, struct msg_type* pMsg) {
-    int ret = 0;
-    bool bOk = true;
-    int fd = pData->m_fd; 
-    int n = pData->m_fd;
-    int size = pMsg->m_size;
-    
-    bOk = m_msgOper->pushMsg(n, &pData->m_rcvMsgQue, pMsg);
-    if (bOk) { 
-        ret = 0;
-        m_dealer->calcMsgIn(ret, size); 
-        m_dealer->addNewTask(&pData->m_deallist);
-    } else {
-        LOG_WARN("dispatchMsg| fd=%d| state=%d|"
-            " len=%d| msg=pushmsg error|",
-            fd, pData->m_state, size); 
-
-        ret = -1;
-    }
-    
-    return ret;
-}
-
-unsigned int SockDirector::procTask(unsigned int state, 
-    struct TaskElement* task) {
-    unsigned int ev = WORK_EVENT_OUT;
-    SockData* pData = NULL;
-
-    pData = containof(task, SockData, m_monlist);
-
-    if (isEventSet(WORK_EVENT_END, state)) {
-        if (SOCK_STATE_ESTABLISHED == pData->m_state
-            || SOCK_STATE_LOGIN == pData->m_state) {
-            pData->m_state = SOCK_STATE_CLOSING;
-            m_center->delEvent(pData->m_fd, SOCK_READ, pData);
-            m_center->delEvent(pData->m_fd, SOCK_WRITE, pData);
-
-            m_sockConf->onClosed(pData);
-            
-            ev = procStopTask(pData);
-        } else if (SOCK_STATE_CONNECTING == pData->m_state) {
-            pData->m_state = SOCK_STATE_CLOSING;
-            m_center->delEvent(pData->m_fd, SOCK_WRITE, pData);
-            
-            m_sockConf->onFailConnect(pData);
-            ev = procStopTask(pData);
-        }
-    } 
-
-    if (isEventSet(DIRECT_STOP_SOCK, state)) {
-        ev = procStopTask(pData);
-    } 
-    
-    return ev; 
-}
-
-unsigned int SockDirector::procStopTask(SockData* pData) {  
-    ++pData->m_state;
-    
-    switch (pData->m_state) {
-    case SOCK_STATE_CLOSING_SEND:
-        LOG_DEBUG("stop_send_sock| fd=%d| state=%d| msg=notify send end|", 
-            pData->m_fd, pData->m_state);
-        
-        m_sender->addEndTask(&pData->m_sndlist);
-        m_sender->addWriteTask(&pData->m_sndlist);
-        break;
-
-    case SOCK_STATE_CLOSING_RECV:   
-        LOG_DEBUG("stop_receive_sock| fd=%d| state=%d| msg=notify receive end|", 
-            pData->m_fd, pData->m_state);
-        
-        m_receiver->addEndTask(&pData->m_rcvlist);
-        m_receiver->addReadTask(&pData->m_rcvlist);
-        break;
-
-    case SOCK_STATE_CLOSING_DEAL:
-        LOG_DEBUG("stop_deal_sock| fd=%d| state=%d| msg=notify deal end|", 
-            pData->m_fd, pData->m_state);
-        
-        m_dealer->addEndTask(&pData->m_deallist);
-        break;
-
-    case SOCK_STATE_CLOSED:
-    default:
-        LOG_INFO("proc_stop_sock| fd=%d| state=%d| msg=close socket ok|", 
-            pData->m_fd, pData->m_state);
-        
-        if (0 <= pData->m_fd) { 
-            releaseSock(pData);
-        }
-
-        return WORK_EVENT_END;
-    } 
-    
-	return DIRECT_STOP_SOCK;
-}
-
-int SockDirector::initSock(SockData* pData, bool isSrv) {
-    int ret = 0;
-    
-    clean(&pData->m_rcvMsgQue);
-    clean(&pData->m_sndMsgQue);
-
-    INIT_TASK_ELE(&pData->m_rcvlist);
-    INIT_TASK_ELE(&pData->m_sndlist);
-    INIT_TASK_ELE(&pData->m_deallist);
-    INIT_TASK_ELE(&pData->m_monlist);
-    
-    TimerList::initTimerParam(&pData->m_rcv_timer);
-    TimerList::initTimerParam(&pData->m_snd_timer);
-    TimerList::initTimerParam(&pData->m_deal_timer);
-
-    pData->m_isSrv = isSrv;
-    ret = m_msgOper->initQue(&pData->m_sndMsgQue);
-    if (0 == ret) {
-        ret = m_msgOper->initQue(&pData->m_rcvMsgQue);
-        if (0 == ret) { 
-            return 0;
-        } else {
-            m_msgOper->finishQue(&pData->m_sndMsgQue);
-        }
-    } 
-
-    return ret;
-}
-
-void SockDirector::finishSock(SockData* pData) {
-    m_msgOper->finishQue(&pData->m_sndMsgQue);
-    m_msgOper->finishQue(&pData->m_rcvMsgQue);
-}
-
-SockData* SockDirector::allocSock(int fd, bool isSrv) {
-    int ret = 0;
-    SockData* pData = NULL;
-
-    pData = m_cache->allocData(fd, POLL_TYPE_SOCKET, NULL); 
-    if (NULL != pData) {
-        ret = initSock(pData, isSrv);
-        if (0 == ret) {
-            return pData;
-        } else {
-            m_cache->freeData(pData);
-            return NULL;
-        }
-    } else { 
-        return NULL;
-    }
-}
-
-int SockDirector::prepareSockSync(SockData* pData, bool isSrv) {
-    int ret = 0;
-
-    if (isSrv) {
-        ret = m_sockConf->onAccepted(pData);
-    } else {
-        ret = m_sockConf->onConnected(pData);
-    }
-
-    if (0 == ret) {        
-        m_sender->startSendWork(pData); 
-        
-        m_dealer->startDealWork(pData);
-        m_receiver->startReceiveWork(pData);
-    }
-
-    return ret;
-}
-
-int SockDirector::prepareSockAsync(SockData* pData) {
-    int ret = 0;
-    
-    ret = m_sender->startConnWork(pData); 
-    return ret;
-}
-
-SockData* SockDirector::allocData(int fd, int cmd) {
-    SockData* pData = NULL;
-    
-    pData = m_cache->allocData(fd, cmd, NULL);     
-    return pData;
-}
-
-void SockDirector::releaseData(SockData* pData) {
-    int fd = 0;
-    
-    if (0 <= pData->m_fd) {
-        fd = pData->m_fd;
-        
-        m_cache->freeData(pData);
-        SockTool::closeFd(fd);
-    }
-}
-
-void SockDirector::releaseSock(SockData* pData) {
-    int fd = 0;
-
-    if (0 <= pData->m_fd) {
-        fd = pData->m_fd;
-
-        finishSock(pData);
-        m_cache->freeData(pData);
-        SockTool::closeFd(fd);
-    }
-}
-
-int SockDirector::asyncConnOk(SockData* pData) { 
-    int ret = 0;
-    
-    ret = m_sockConf->onConnected(pData);
-    if (0 == ret) {
-        m_dealer->startDealWork(pData);
-        m_receiver->startReceiveWork(pData);
-    } 
-
-    return ret;
-}
-
-int SockDirector::addWrEvent(SockData* pData) {
-    m_center->addEvent(pData->m_fd, SOCK_WRITE, pData);
-    
-    return 0;
-}
-
-int SockDirector::addRdEvent(SockData* pData) {
-    m_center->addEvent(pData->m_fd, SOCK_READ, pData);
-    
-    return 0;
-}
-
-SockData* SockDirector::getSock(int fd) {
-    return m_cache->getData(fd);
-}
-
-int SockDirector::process(SockData* pData, struct msg_type* pMsg) {
-    int ret = 0;
-
-    ret = m_sockConf->process(pData, pMsg); 
-    return ret; 
-}
-
-int SockDirector::startEstabSock(int fd, bool isSrv) {
-    int ret = 0;
-    SockData* pData = NULL;
-
-    pData = allocSock(fd, isSrv);
-    if (NULL != pData) {
-        ret = prepareSockSync(pData, isSrv);
-        if (0 == ret) { 
-            return 0;
-        } else {
-            releaseSock(pData);
-            return ret;
+            break;
         } 
-    } else {
-        SockTool::closeFd(fd);
-        return SOCK_ADD_ALLOC_ERR;
-    }
+
+        base = creatNode(fd, ENUM_NODE_LISTENER, ENUM_FD_NORMAL);
+        addEvent(EVENT_TYPE_RD, base);
+
+        LOG_INFO("++++add_listener| fd=%d| addr=%s:%d| msg=ok|",
+            fd, param->m_ip, param->m_port);
+
+        return 0;
+    } while (0);
+
+    LOG_ERROR("****add_listener| addr=%s:%d| ret=%d| msg=error|",
+        param->m_ip, param->m_port, ret);
+    
+    return ret;
 }
 
- int SockDirector::startConnSock(int fd) {
-    int ret = 0;
-    SockData* pData = NULL;
+Int32 Director::addConnector(TcpParam* param) {
+    Int32 ret = 0;
+    Int32 fd = -1;
+    NodeBase* base = NULL;
 
-    pData = allocSock(fd, false);
-    if (NULL != pData) {
-        ret = prepareSockAsync(pData);
-        if (0 == ret) { 
-            return 0;
-        } else {
-            releaseSock(pData);
-            return ret;
+    do { 
+        ret = connFast(param, &fd);
+        if (0 > ret) {            
+            ret = -1;
+            break;
         } 
-    } else {
-        SockTool::closeFd(fd);
-        return SOCK_ADD_ALLOC_ERR;
+
+        base = creatNode(fd, ENUM_NODE_SOCK_CONNECTOR, 
+            ENUM_FD_CONNECTING, param->m_ip, param->m_port); 
+
+        /* just add write event, add read while connect ok */
+        addEvent(EVENT_TYPE_WR, base);
+
+
+        LOG_INFO("++++add_connect| fd=%d| addr=%s:%d| msg=ok|",
+            fd, param->m_ip, param->m_port);
+
+        return 0;
+    } while (0);
+
+    LOG_ERROR("****add_listener| addr=%s:%d| ret=%d| msg=error|",
+        param->m_ip, param->m_port, ret);
+    
+    return ret;
+}
+
+Int32 Director::addListener(const Char ip[], int port) {
+    Int32 ret = 0;
+    TcpParam param;
+
+    ret = buildParam(ip, port, &param);
+    if (0 != ret) { 
+        LOG_ERROR("****add_listener| addr=%s:%d| ret=%d| msg=parse error|",
+            ip, port, ret);
+
+        return ret;
     }
- }
+
+    ret = addListener(&param);
+    return ret;
+}
+
+Int32 Director::addConnector(const Char ip[], int port) {
+    Int32 ret = 0;
+    TcpParam param;
+
+    ret = buildParam(ip, port, &param);
+    if (0 != ret) { 
+        LOG_ERROR("****add_connect| addr=%s:%d| ret=%d| msg=parse error|",
+            ip, port, ret);
+
+        return ret;
+    }
+
+    ret = addConnector(&param);
+    return ret;
+}
+
+Void Director::freeNodes() {
+    list_node* pos = NULL;
+    list_node* n = NULL;
+    NodeBase* node = NULL;
+    list_head* list = &m_node_que;
+
+    if (!list_empty(list)) {
+        list_for_each_safe(pos, n, list) {
+            list_del(pos, list);
+
+            node = list_entry(pos, NodeBase, m_node);
+            
+            freeNode(node);
+        }
+    }
+}
 

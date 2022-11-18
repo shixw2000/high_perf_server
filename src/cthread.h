@@ -1,52 +1,38 @@
 #ifndef __CTHREAD_H__
 #define __CTHREAD_H__
-#include<pthread.h>
-#include<unistd.h>
+#include"interfobj.h"
 
-class CThread {
+
+class CThread : public I_Service {
+    struct _intern;
+    
 public:
     CThread();
     virtual ~CThread();
 
-    int start(const char name[]);
-    void stop();
-    
-    int join();
-    int cancel();
-    int kill(int sig);
-    void testkill();
-    
-    pthread_t getThrid() const { return m_thr; }
+    unsigned long getThr() const;
 
-    static int sleepSec(int sec);
+    int start(const char name[], I_Service* service = NULL);
     
-    static int sleepMiliSec(int milisec);
-    
-    static pid_t forkSelf();
+    void join(); 
 
-protected:
-    virtual int prepareRun() { return 0; }
-    virtual void postRun() {}
-    virtual int run() = 0;
-    bool isRun();
+    virtual int run() {
+        int ret = 0;
+        
+        if (NULL != m_service) {
+            ret = m_service->run();
+        }
+
+        return ret;
+    }
 
 private:
     static void* activate(void* arg);
     
-protected:
-    pthread_t m_thr;
-    bool m_isRun;
-    char m_name[32];
+private:
+    struct _intern* m_intern;
+    I_Service* m_service;
 };
-
-
-extern void armSig(int sig);
-extern void armUsr1();
-extern void armTerm();
-extern void sendsig();
-extern void sendselfsig();
-extern void threadSuspend();
-extern void threadMaskSig();
 
 
 #endif

@@ -1,93 +1,132 @@
 #ifndef __DIRECTOR_H__
 #define __DIRECTOR_H__
-#include"pushpool.h"
+#include"interfobj.h"
+#include"taskpool.h"
+#include"datatype.h"
 
 
+class TickTimer;
+class SockEpoll;
 class Receiver;
 class Sender;
-class MsgDealer;
-class MsgBaseQue;
-class SockDeal;
-class SockCache;
-class SockConf;
-struct msg_type;
+class Dealer;
+class Lock;
+class ObjCenter;
+class Parser;
 
-struct _SockData;
-typedef struct _SockData SockData; 
-
-class SockDirector : public CPushPool { 
+class Director : public TaskThread, public I_TimerDealer {
 public:
-    SockDirector();
-    ~SockDirector();
+    explicit Director(Int32 capacity);
+    virtual ~Director();
 
-    int init();
+    Int32 init();
+    Void finish(); 
+
+    int start();
+    virtual void join();
+    virtual void stop(); 
+
+    inline Void setSockCb(SockCb* cb) {
+        m_cb = cb;
+    }
+
+    inline SockCb* getCb() {
+        return m_cb;
+    }
+
+    inline Int32 capacity() {
+        return m_capacity;
+    }
     
-    void finish(); 
+    Int32 getSize() const;
 
-    void setCenter(SockDeal* center);
-    void setConf(SockConf* sockConf);
+    Int32 sendCmd(MsgHdr* msg);
+    Int32 sendMsg(NodeBase* base, MsgHdr* msg);
+    Int32 dispatch(NodeBase* base, MsgHdr* msg);
 
-    int startSvc();
-
-    void waitSvc();
-
-    void stopSvc();
-
-    bool hasSvc() const;
+    Uint32 getTick() const;
+    Uint32 getTime() const;
+    Void procTick(EnumThreadType type, Uint32 cnt);
+    Void notify(EnumThreadType type, NodeBase* base, Uint16 cmd, Uint64 data);
+      
+    NodeBase* creatNode(Int32 fd, Int32 type, Int32 status);
+    NodeBase* creatNode(Int32 fd, Int32 type, Int32 status,
+        const Char* ip, Int32 port); 
     
-    void dealTimerSec(SockData* pTimer);
-    int dealWriteSock(SockData* pData);   
-    int dealReadSock(SockData* pData);
-        
-    int sendMsg(SockData* pData, struct msg_type* pMsg);
-    int sendData(SockData* pData, char* psz, int len);
-    int dispatchMsg(SockData* pData, struct msg_type* pMsg);    
-  
-    void stopSock(SockData* pData);
-    void closeSock(int reason, SockData* pData);
+    int delNode(NodeBase* node);
+    int addEvent(Int32 ev_type, NodeBase* node);
+    int delEvent(Int32 ev_type, NodeBase* node);
 
-    SockData* allocData(int fd, int cmd);
-    void releaseData(SockData* pData);
+    Void close(NodeBase* base); 
     
-     int startEstabSock(int fd, bool isSrv);
-     int startConnSock(int fd);
+    virtual void procTaskEnd(struct Task* task);
+    virtual unsigned int procTask(struct Task* task); 
 
-     int addWrEvent(SockData* pData);
-     int addRdEvent(SockData* pData);
-
-     int asyncConnOk(SockData* pData);
+    virtual Void doTimeout(struct TimerEle* ele);
     
-    SockData* getSock(int fd); 
+    void addTimer(struct TimerEle* ele, Int32 type, Uint32 interval);
 
-    int process(SockData* pData, struct msg_type* pMsg);
+    Bool lock(NodeBase* base);
+    Bool unlock(NodeBase* base);
+
+    Void addReadable(struct NodeBase* base);
+    Void addWriteable(struct NodeBase* base);
+
+    Uint32 readNode(struct NodeBase* base);
+    Uint32 writeNode(struct NodeBase* base);
+    Void dealMsg(struct NodeBase* base, struct MsgHdr* msg);
+
+
+
+    Int32 addListener(TcpParam* param);
+    Int32 addConnector(TcpParam* param);
+    Int32 addListener(const Char ip[], int port);
+    Int32 addConnector(const Char ip[], int port);
 
 protected: 
-    virtual unsigned int procTask(unsigned int state, 
-        struct TaskElement* task);
-    
-    unsigned int procStopTask(SockData* pData); 
+    virtual int setup();
+    virtual void teardown();
 
-    int initSock(SockData* pData, bool isSrv);
-
-    void finishSock(SockData* pData);
-
-    SockData* allocSock(int fd, bool isSrv); 
-    void releaseSock(SockData* pData);    
-
-    int prepareSockSync(SockData* pData, bool isSrv);
-    int prepareSockAsync(SockData* pData);
+    virtual void check();
+    virtual void wait();
+    virtual void alarm();
 
 private:
+    Void doTick(Uint32 cnt);
+
+    Int32 pushMsg(EnumThreadType type, NodeBase* base, MsgHdr* msg);
+    Int32 pushWrite(NodeBase* base, MsgHdr* msg);
+    Int32 pushDeal(NodeBase* base, MsgHdr* msg);
+    Int32 pushCmd(NodeBase* base, MsgHdr* msg);
+        
+    Void procNodeQue(NodeBase* base);
+    Void dealCmd(NodeBase* base, MsgHdr* msg);
+    Void procStopMsg(NodeBase* base, MsgHdr* msg);
+    
+    Int32 creatTimer();
+    Int32 creatEvent();    
+
+    Void freeNodes();
+
+    
+private:
+    const Int32 m_capacity;
+
+    list_head m_node_que;
+    
+    Lock* m_lock;
+    TickTimer* m_timer;
+    SockEpoll* m_epoll;
     Receiver* m_receiver;
     Sender* m_sender;
-    MsgDealer* m_dealer;
-    MsgBaseQue* m_msgOper;
-    SockCache* m_cache;
-    SockDeal* m_center;
-    SockConf* m_sockConf;
-    bool m_hasSvc;
-};
+    Dealer* m_dealer;
 
+    NodeBase* m_event_node;
+    NodeBase* m_timer_node; 
+    ObjCenter* m_obj; 
+    
+    SockCb* m_cb;
+};
 
 #endif
 

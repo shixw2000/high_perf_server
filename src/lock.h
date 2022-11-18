@@ -16,8 +16,8 @@ public:
 
 class EmptyLock : public Lock {
 public:
-    virtual bool lock(int n) { return true; }
-    virtual bool unlock(int n) { return true; }
+    virtual bool lock(int) { return true; }
+    virtual bool unlock(int) { return true; }
 };
 
 class SpinLock : public Lock {
@@ -50,6 +50,37 @@ private:
     const int m_capacity;
     const int m_mask;
     pthread_spinlock_t* m_locks;
+};
+
+class MutexLock : public Lock {
+public:
+    MutexLock();
+    ~MutexLock();
+    
+    int init();
+    void finish();
+    
+    virtual bool lock(int n = -1);
+    virtual bool unlock(int n = -1);
+
+protected:
+    pthread_mutex_t* m_mutex;
+};
+
+class MutexCond : public MutexLock {
+public:
+    MutexCond();
+    ~MutexCond();
+    
+    virtual int init();
+    virtual void finish();
+    
+    virtual bool signal();
+    virtual bool broadcast();
+    virtual bool wait();
+
+private:
+    pthread_cond_t* m_cond;
 };
 
 #endif

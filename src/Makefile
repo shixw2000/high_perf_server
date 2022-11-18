@@ -1,30 +1,24 @@
-release=
 
 RM=rm -f
 
-COMILE_OPT=-Wno-unused-parameter
-MACROS=-D__USE_MB__ -D__UNUSE_TIMER__N \
-        -D__USE_UNIX__N 
+VERSION:=$(shell date "+%F_%T")
+COMILE_OPT=
+MACROS=-D__BUILD_VER__="\"V1.0 $(VERSION)\""
 
-ifndef release
-CC=g++ -g -W -Wall -D__LOG_LEVEL__=3 $(MACROS) $(COMILE_OPT)
+ifdef debug
+CC=g++ -g -W -Wall $(MACROS) $(COMILE_OPT)
 else
-#-s :删除可执行程序中的所有符号表和所有重定位信息。其结果与运行命令 strip 所达到的效果相同
-CC=g++ -s -O3 -W -Wall -D__LOG_LEVEL__=2 $(MACROS) $(COMILE_OPT)
+#-s :strip symbols 
+CC=g++ -s -O3 -W -Wall $(MACROS) $(COMILE_OPT)
 endif
 
 
 prog:=bin_test
 inc_dir=
 lib_dir=
-libs=-lpthread
+libs=-lpthread -lrt
 
-srcs=client.cpp server.cpp socktool.cpp sockpool.cpp sockdata.cpp \
-	cthread.cpp hlist.cpp receiver.cpp sender.cpp \
-	transhandler.cpp worker.cpp taskhandler.cpp pushpool.cpp \
-	service.cpp statemachine.cpp sockmonitor.cpp task.cpp \
-	msgdealer.cpp msgpool.cpp lock.cpp hque.cpp director.cpp \
-	sockdeal.cpp sockconf.cpp
+srcs=$(wildcard *.cpp) 
 	
 objs=$(srcs:.cpp=.o)
 
