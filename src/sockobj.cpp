@@ -21,7 +21,7 @@ int MsgReader::read(NodeBase* node, Director* director) {
         } else {
             return -1;
         }
-    } else if (0 == ret) {
+    } else if (0 == rdlen) {
         return 0;
     } else {
         return -1;
